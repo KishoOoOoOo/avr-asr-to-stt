@@ -8,10 +8,9 @@ const SileroVADStream = require('./silero_stream'); // Require from same directo
 const app = express();
 
 // --- Configuration ---
-// Use environment variables with defaults
-const MIN_SPEECH_DURATION = parseInt(process.env.VAD_MIN_SPEECH_DURATION_MS || '1000', 10); // Minimum speech duration in milliseconds
-// IMPORTANT: Ensure the path '/transcribe' is correct for your STT service or update STT_URL in your .env file
-const STT_URL = process.env.STT_URL || 'http://localhost:6021/transcribe'; // URL of the STT service
+// Use environment variables with defaults - ADJUSTED FOR BETTER ARABIC RECOGNITION
+const MIN_SPEECH_DURATION = parseInt(process.env.VAD_MIN_SPEECH_DURATION_MS || '800', 10); // Reduced minimum duration
+const STT_URL = process.env.STT_URL || 'http://localhost:6022/transcribe'; // Updated default port
 
 // Audio configuration (Input from client)
 const INPUT_AUDIO_CONFIG = {
@@ -20,7 +19,7 @@ const INPUT_AUDIO_CONFIG = {
   bitsPerSample: 16,
 };
 
-// Path to the ONNX model (relative to this server.js file) - Keeping this hardcoded for now
+// Path to the ONNX model (relative to this server.js file)
 const MODEL_PATH = path.join(__dirname, 'silero_vad.onnx');
 if (!fs.existsSync(MODEL_PATH)) {
     console.error(`\n!!! FATAL ERROR: ONNX model not found at ${MODEL_PATH}`);
@@ -28,41 +27,82 @@ if (!fs.existsSync(MODEL_PATH)) {
     process.exit(1);
 }
 
+/**
+ * Simple upsampling function from 8kHz to 16kHz
+ * @param {Buffer} inputBuffer - Input audio buffer at 8kHz
+ * @returns {Buffer} Output audio buffer at 16kHz
+ */
+function upsampleTo16kHz(inputBuffer) {
+  const inputSamples = [];
+  
+  // Convert buffer to samples
+  for (let i = 0; i < inputBuffer.length; i += 2) {
+    const sample = inputBuffer.readInt16LE(i);
+    inputSamples.push(sample);
+  }
+  
+  // Simple linear interpolation upsampling (2x)
+  const outputSamples = [];
+  
+  for (let i = 0; i < inputSamples.length - 1; i++) {
+    // Keep original sample
+    outputSamples.push(inputSamples[i]);
+    
+    // Interpolate between current and next sample
+    const interpolated = Math.round((inputSamples[i] + inputSamples[i + 1]) / 2);
+    outputSamples.push(interpolated);
+  }
+  
+  // Add last sample
+  if (inputSamples.length > 0) {
+    outputSamples.push(inputSamples[inputSamples.length - 1]);
+    outputSamples.push(inputSamples[inputSamples.length - 1]); // Duplicate for even count
+  }
+  
+  // Convert back to buffer
+  const outputBuffer = Buffer.allocUnsafe(outputSamples.length * 2);
+  for (let i = 0; i < outputSamples.length; i++) {
+    outputBuffer.writeInt16LE(outputSamples[i], i * 2);
+  }
+  
+  return outputBuffer;
+}
+
 // --- VAD Stream Handler ---
 const handleAudioStream = async (req, res) => {
   let speechStartTime = null;
-  let vadStream = null; // Define vadStream here to access it in error handlers
+  let vadStream = null;
+  let accumulatedSpeechBuffer = Buffer.alloc(0); // Track complete speech segments
 
-  // The VAD service only detects speech and forwards audio.
-  // It NOW waits for transcription and sends it back to the original client.
-  // The client would need a separate mechanism (e.g., WebSocket) to get results.
-  res.setHeader("Content-Type", "text/plain; charset=utf-8"); // Ensure correct encoding for text
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
   console.log(`\n[${new Date().toISOString()}] VAD Service: New connection`);
 
   try {
-      // Use environment variables for VAD parameters
-      const vadThreshold = parseFloat(process.env.VAD_THRESHOLD || '0.2');
-      const vadMinSilenceMs = parseInt(process.env.VAD_MIN_SILENCE_MS || '500', 10);
-      const vadSpeechPadMs = parseInt(process.env.VAD_SPEECH_PAD_MS || '300', 10);
+      // Optimized VAD parameters for Arabic speech
+      const vadThreshold = parseFloat(process.env.VAD_THRESHOLD || '0.3'); // Lower threshold for better sensitivity
+      const vadMinSilenceMs = parseInt(process.env.VAD_MIN_SILENCE_MS || '600', 10); // Longer silence detection
+      const vadSpeechPadMs = parseInt(process.env.VAD_SPEECH_PAD_MS || '400', 10); // More padding
       const onnxProvider = process.env.ONNX_PROVIDER || 'cpu';
 
       vadStream = new SileroVADStream({
-        inputSampleRate: INPUT_AUDIO_CONFIG.sampleRate,
+        inputSampleRate: INPUT_AUDIO_CONFIG.sampleRate, // 8kHz input
         modelPath: MODEL_PATH,
-        // Use parameters from environment variables or defaults
         threshold: vadThreshold,
         minSilenceDurationMs: vadMinSilenceMs,
         speechPadMs: vadSpeechPadMs,
-        provider: onnxProvider // Pass provider from env
+        provider: onnxProvider,
+        // Additional parameters for better Arabic detection
+        frameSize: 512, // Standard frame size
+        sampleRate: 16000 // VAD internal processing rate
       });
 
-      // Get the actual sample rate the VAD stream outputs (likely 16000Hz)
-      const outputSampleRate = vadStream.options.sampleRate;
-      console.log(`[VAD Service] VAD initialized. Outputting audio at ${outputSampleRate}Hz.`);
-      console.log(` - Threshold: ${vadThreshold}, Min Silence: ${vadMinSilenceMs}ms, Padding: ${vadSpeechPadMs}ms, Provider: ${onnxProvider}`);
+      const outputSampleRate = vadStream.options.sampleRate; // Should be 16000Hz
+      console.log(`[VAD Service] VAD initialized. Input: ${INPUT_AUDIO_CONFIG.sampleRate}Hz, VAD Processing: ${outputSampleRate}Hz`);
+      console.log(` - Threshold: ${vadThreshold}, Min Silence: ${vadMinSilenceMs}ms, Padding: ${vadSpeechPadMs}ms`);
+      console.log(` - Provider: ${onnxProvider}, Min Speech Duration: ${MIN_SPEECH_DURATION}ms`);
 
       req.pipe(vadStream)
         .on('error', (err) => {
@@ -73,114 +113,120 @@ const handleAudioStream = async (req, res) => {
           }
         })
         .on("data", async ({ speech: speechEvent, audioData: chunk }) => {
-          // chunk is at VAD's internal rate (e.g., 16kHz)
 
           if (speechEvent.start) {
             console.log(`(${new Date().toISOString()}) VAD Service: Speech Start Detected`);
             speechStartTime = Date.now();
-            // No file handling needed here
+            accumulatedSpeechBuffer = Buffer.alloc(0); // Reset accumulated buffer
+            
+            // Start accumulating audio data
+            if (chunk && chunk.length > 0) {
+              accumulatedSpeechBuffer = Buffer.concat([accumulatedSpeechBuffer, chunk]);
+            }
+          }
+
+          if (speechEvent.state && chunk) {
+            // Continue accumulating speech data
+            accumulatedSpeechBuffer = Buffer.concat([accumulatedSpeechBuffer, chunk]);
           }
 
           if (speechEvent.end) {
-            const speechDuration = Date.now() - speechStartTime;
+            const speechDuration = speechStartTime ? Date.now() - speechStartTime : 0;
             console.log(`(${new Date().toISOString()}) VAD Service: Speech End Detected - Duration: ${(speechDuration / 1000).toFixed(2)}s`);
 
-            // Reset start time for next segment
             speechStartTime = null;
 
-            // Use the chunk directly from the end event (includes padding)
-            const combinedAudio = chunk && chunk.length > 0 ? chunk : Buffer.alloc(0);
+            // Use accumulated audio buffer or the chunk from end event
+            const finalAudioData = chunk && chunk.length > 0 ? chunk : accumulatedSpeechBuffer;
 
-            if (!combinedAudio || combinedAudio.length === 0) {
-              console.log("[VAD Service] Speech end event received no audio data, discarding.");
+            if (!finalAudioData || finalAudioData.length === 0) {
+              console.log("[VAD Service] No audio data available for transcription, discarding.");
+              accumulatedSpeechBuffer = Buffer.alloc(0);
               return;
             }
 
+            // Check minimum duration
             if (speechDuration >= MIN_SPEECH_DURATION) {
-              console.log(`[VAD Service] Sending audio chunk (${(combinedAudio.length / 1024).toFixed(2)} KB, ${outputSampleRate}Hz) to STT Service...`);
+              console.log(`[VAD Service] Processing speech segment: ${(finalAudioData.length / 1024).toFixed(2)} KB`);
 
               try {
-                // Send raw audio buffer and sample rate to transcription service
-                const response = await axios.post(STT_URL, combinedAudio, { // Use STT_URL
+                // The audio from VAD is at 16kHz, send it directly
+                const audioToSend = finalAudioData;
+                const sampleRateToSend = outputSampleRate; // 16000Hz
+
+                console.log(`[VAD Service] Sending audio to STT: ${(audioToSend.length / 1024).toFixed(2)} KB at ${sampleRateToSend}Hz`);
+
+                const response = await axios.post(STT_URL, audioToSend, {
                     headers: {
                         'Content-Type': 'application/octet-stream',
-                        'X-Sample-Rate': outputSampleRate // Send sample rate as a header
+                        'X-Sample-Rate': sampleRateToSend,
+                        'X-Audio-Format': 'audio/x-signed-linear'
                     },
-                    maxBodyLength: Infinity, // Allow large audio buffers
-                    maxContentLength: Infinity
+                    maxBodyLength: Infinity,
+                    maxContentLength: Infinity,
+                    timeout: 30000 // 30 second timeout
                 });
-                console.log(`[VAD Service] Successfully sent audio to STT Service. Status: ${response.status}`); // Updated log
 
-                // Extract transcription from the response
+                console.log(`[VAD Service] STT Response Status: ${response.status}`);
+
                 const transcription = response.data && response.data.transcription;
 
-                if (transcription && !res.writableEnded) {
-                    console.log(`[VAD Service] Received transcription: \"${transcription}\". Sending back to client.`);
-                    // Send transcription back to the original client
-                    res.write(transcription + "\n"); // Add newline as a delimiter
-                } else if (!res.writableEnded) {
-                     console.log("[VAD Service] Received empty or no transcription data from service.");
-                     // Optionally send an indication back to client
-                     // res.write("[No transcription]\n");
-                }
-
-              } catch (err) { // Renamed error variable for clarity
-                console.error(`[VAD Service] Failed to send/receive from STT Service at ${STT_URL}`); // Updated log
-                if (err.response) {
-                    // The request was made and the server responded with a status code
-                    // that falls out of the range of 2xx
-                    console.error(` - Status: ${err.response.status}`);
-                    console.error(` - Data: ${JSON.stringify(err.response.data)}`); // Log response data if available
-                } else if (err.request) {
-                    // The request was made but no response was received
-                    console.error(' - No response received:', err.message);
+                if (transcription && transcription.trim() && !res.writableEnded) {
+                    console.log(`[VAD Service] ✓ Transcription: "${transcription}"`);
+                    res.write(transcription.trim() + "\n");
                 } else {
-                    // Something happened in setting up the request that triggered an Error
-                    console.error(' - Error setting up request:', err.message);
+                     console.log("[VAD Service] ✗ Empty or no transcription received");
+                     // Optionally send feedback to client
+                     // res.write("[No speech detected]\n");
                 }
 
-                // Inform the client about the error
-                 if (!res.writableEnded) {
-                    res.write("[VAD Service: Error during transcription process]\n");
-                 }
+              } catch (err) {
+                console.error(`[VAD Service] ✗ STT Service Error:`);
+                if (err.response) {
+                    console.error(` - HTTP Status: ${err.response.status}`);
+                    console.error(` - Response: ${JSON.stringify(err.response.data)}`);
+                } else if (err.request) {
+                    console.error(` - Network Error: ${err.message}`);
+                    console.error(` - STT URL: ${STT_URL}`);
+                } else {
+                    console.error(` - Setup Error: ${err.message}`);
+                }
+
+                if (!res.writableEnded) {
+                    res.write("[Transcription service error]\n");
+                }
               }
             } else {
-              console.log(`[VAD Service] Speech too short (${(speechDuration / 1000).toFixed(2)}s), discarding.`);
+              console.log(`[VAD Service] ✗ Speech too short: ${(speechDuration / 1000).toFixed(2)}s (min: ${MIN_SPEECH_DURATION/1000}s)`);
             }
-          } // end speech.end handling
-        }) // end vadStream.on('data')
+
+            // Reset accumulated buffer
+            accumulatedSpeechBuffer = Buffer.alloc(0);
+          }
+        })
         .on('finish', () => {
-          console.log(`(${new Date().toISOString()}) VAD Service: VAD Stream finished processing.`);
-          // Do NOT end the response here automatically.
-          // End it only when the client connection ends (req.on('end'))
-          // or if a critical error occurs.
-          // if (!res.writableEnded) {
-          //   res.end();
-          // }
+          console.log(`(${new Date().toISOString()}) VAD Service: Stream finished`);
         });
 
   } catch (initError) {
-      console.error(`[VAD Service] Failed to initialize VAD stream: ${initError.message}`);
+      console.error(`[VAD Service] Initialization failed: ${initError.message}`);
       if (!res.writableEnded) {
-          res.status(500).write(`VAD Initialization Error: ${initError.message}\n`);
+          res.status(500).write(`VAD Init Error: ${initError.message}\n`);
           res.end();
       }
-      return; // Stop further processing
+      return;
   }
 
   req.on("end", () => {
-    console.log(`(${new Date().toISOString()}) VAD Service: Client connection ended.`);
-    // VAD stream 'finish' event usually handles ending the response.
-    // Ensure it ends if it hasn't already.
+    console.log(`(${new Date().toISOString()}) VAD Service: Client disconnected`);
     if (!res.writableEnded) {
         res.end();
     }
   });
 
   req.on("error", (err) => {
-    console.error(`(${new Date().toISOString()}) VAD Service: Request stream error:`, err);
-    if (vadStream) {
-        vadStream.unpipe(req);
+    console.error(`(${new Date().toISOString()}) VAD Service: Request error:`, err.message);
+    if (vadStream && !vadStream.destroyed) {
         vadStream.destroy(err);
     }
     if (!res.headersSent) {
@@ -191,9 +237,22 @@ const handleAudioStream = async (req, res) => {
   });
 };
 
-
 // --- Route Configuration ---
 app.post('/speech-to-text-stream', handleAudioStream);
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    service: 'VAD Service',
+    timestamp: new Date().toISOString(),
+    config: {
+      minSpeechDuration: MIN_SPEECH_DURATION,
+      sttUrl: STT_URL,
+      vadThreshold: process.env.VAD_THRESHOLD || '0.3'
+    }
+  });
+});
 
 // Start the VAD server
 const VAD_PORT = process.env.PORT || 6019;
@@ -201,6 +260,8 @@ app.listen(VAD_PORT, () => {
   console.log(`\n=== VAD Service Started ===`);
   console.log(`Timestamp: ${new Date().toISOString()}`);
   console.log(`Listening on port ${VAD_PORT}`);
-  console.log(`Forwarding audio to: ${STT_URL}`); // Use STT_URL
+  console.log(`STT Service: ${STT_URL}`);
+  console.log(`Min Speech Duration: ${MIN_SPEECH_DURATION}ms`);
+  console.log(`Input: ${INPUT_AUDIO_CONFIG.sampleRate}Hz -> VAD: 16kHz`);
   console.log(`========================\n`);
 });
